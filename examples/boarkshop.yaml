@@ -14,7 +14,8 @@ listeners:
     read_header_timeout: 5s
 
   telegram:
-    bots: []
+    bots_dir: bots
+    reload_interval: 1s
 
   cron:
     timezone: UTC

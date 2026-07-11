@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -189,6 +191,99 @@ steps:
 	}
 }
 
+func TestRunLoadsTelegramBotAddedAfterStartup(t *testing.T) {
+	root := t.TempDir()
+	var requests atomic.Int32
+	telegramAPI := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if requests.Add(1) > 1 {
+			select {
+			case <-request.Context().Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = response.Write([]byte(`{"ok":true,"result":[]}`))
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":42},"text":"hot add"}}]}`))
+	}))
+	defer telegramAPI.Close()
+
+	pipelineDir := filepath.Join(root, "pipelines", "telegram-demo")
+	manifest := fmt.Sprintf(`
+version: 1
+id: telegram-demo
+env:
+  GO_WANT_BOARKSHOP_HELPER: "1"
+guard:
+  argv: [%q, "-test.run=TestBoarkshopHelperProcess", "--", "telegram-guard"]
+  timeout: 2s
+steps:
+  - id: write
+    argv: [%q, "-test.run=TestBoarkshopHelperProcess", "--", "write"]
+    timeout: 2s
+  - id: finish
+    argv: [%q, "-test.run=TestBoarkshopHelperProcess", "--", "finish"]
+    timeout: 2s
+`, os.Args[0], os.Args[0], os.Args[0])
+	writeFile(t, filepath.Join(pipelineDir, "pipeline.yaml"), manifest)
+
+	configPath := filepath.Join(root, "boarkshop.yaml")
+	writeFile(t, configPath, `
+version: 1
+data_dir: data
+pipelines_dir: pipelines
+queue_size: 8
+max_parallel_processes: 2
+shutdown_timeout: 3s
+listeners:
+  telegram:
+    bots_dir: bots
+    reload_interval: 10ms
+  cron:
+    timezone: UTC
+`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, configPath, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Run: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+
+	botsDir := filepath.Join(root, "bots")
+	waitForFile(t, botsDir, 3*time.Second)
+	stagingDir := filepath.Join(root, "bot-staging")
+	writeFile(t, filepath.Join(stagingDir, "token"), "hot-token\n")
+	writeFile(t, filepath.Join(stagingDir, "bot.yaml"), fmt.Sprintf(`
+version: 1
+id: hot-bot
+token: {file: token}
+api_base: %q
+poll_timeout: 1s
+`, telegramAPI.URL))
+	if err := os.Rename(stagingDir, filepath.Join(botsDir, "hot-bot")); err != nil {
+		t.Fatalf("publish bot: %v", err)
+	}
+
+	stateMarker := filepath.Join(root, "data", "pipelines", "telegram-demo", "complete")
+	waitForFile(t, stateMarker, 4*time.Second)
+	if got, err := os.ReadFile(filepath.Join(root, "data", "shared", "seen")); err != nil || string(got) != "telegram" {
+		t.Fatalf("shared marker = %q, %v", got, err)
+	}
+}
+
 func TestValidateAllowsEmptyRuntime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "boarkshop.yaml")
 	writeFile(t, path, "version: 1\n")
@@ -216,6 +311,16 @@ func TestBoarkshopHelperProcess(t *testing.T) {
 		}
 		var eventRoot map[string]any
 		if json.Unmarshal(raw, &eventRoot) != nil || eventRoot["source"] != "http" || eventRoot["method"] != "POST" {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	case "telegram-guard":
+		raw, err := os.ReadFile(os.Getenv("BOARKSHOP_EVENT_FILE"))
+		if err != nil {
+			os.Exit(2)
+		}
+		var eventRoot map[string]any
+		if json.Unmarshal(raw, &eventRoot) != nil || eventRoot["source"] != "telegram" || eventRoot["bot_id"] != "hot-bot" {
 			os.Exit(1)
 		}
 		os.Exit(0)

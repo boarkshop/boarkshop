@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"net"
-	"net/url"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -15,14 +14,15 @@ import (
 )
 
 const (
-	DefaultQueueSize            = 1024
-	DefaultMaxParallelProcesses = 4
-	DefaultShutdownTimeout      = Duration(30 * time.Second)
-	DefaultHTTPAddress          = "127.0.0.1:8080"
-	DefaultHTTPMaxBodyBytes     = int64(1 << 20)
-	DefaultHTTPReadHeader       = Duration(5 * time.Second)
-	DefaultTelegramAPIBase      = "https://api.telegram.org"
-	DefaultTelegramPollTimeout  = Duration(30 * time.Second)
+	DefaultQueueSize              = 1024
+	DefaultMaxParallelProcesses   = 4
+	DefaultShutdownTimeout        = Duration(30 * time.Second)
+	DefaultHTTPAddress            = "127.0.0.1:8080"
+	DefaultHTTPMaxBodyBytes       = int64(1 << 20)
+	DefaultHTTPReadHeader         = Duration(5 * time.Second)
+	DefaultTelegramAPIBase        = "https://api.telegram.org"
+	DefaultTelegramPollTimeout    = Duration(30 * time.Second)
+	DefaultTelegramReloadInterval = Duration(time.Second)
 )
 
 type Instance struct {
@@ -49,19 +49,8 @@ type HTTPListener struct {
 }
 
 type TelegramListener struct {
-	Bots []TelegramBot `yaml:"bots"`
-}
-
-type TelegramBot struct {
-	ID          string   `yaml:"id"`
-	Token       TokenRef `yaml:"token"`
-	APIBase     string   `yaml:"api_base"`
-	PollTimeout Duration `yaml:"poll_timeout"`
-}
-
-type TokenRef struct {
-	Env  string `yaml:"env,omitempty"`
-	File string `yaml:"file,omitempty"`
+	BotsDir        string   `yaml:"bots_dir"`
+	ReloadInterval Duration `yaml:"reload_interval"`
 }
 
 type CronListener struct {
@@ -105,6 +94,10 @@ func defaultInstance(base string) *Instance {
 				MaxBodyBytes:      DefaultHTTPMaxBodyBytes,
 				ReadHeaderTimeout: DefaultHTTPReadHeader,
 			},
+			Telegram: TelegramListener{
+				BotsDir:        filepath.Join(base, "bots"),
+				ReloadInterval: DefaultTelegramReloadInterval,
+			},
 			Cron: CronListener{Timezone: "UTC"},
 		},
 	}
@@ -127,6 +120,14 @@ func (config *Instance) normalizeAndValidate(base string) error {
 	if pathsOverlap(config.DataDir, config.PipelinesDir) {
 		return fmt.Errorf("data_dir and pipelines_dir must be separate, non-nested directories")
 	}
+	config.Listeners.Telegram.BotsDir, err = resolvePath(base, config.Listeners.Telegram.BotsDir)
+	if err != nil {
+		return fmt.Errorf("listeners.telegram.bots_dir: %w", err)
+	}
+	if pathsOverlap(config.DataDir, config.Listeners.Telegram.BotsDir) ||
+		pathsOverlap(config.PipelinesDir, config.Listeners.Telegram.BotsDir) {
+		return fmt.Errorf("bots_dir, data_dir, and pipelines_dir must be separate, non-nested directories")
+	}
 	if config.QueueSize <= 0 {
 		return fmt.Errorf("queue_size must be positive")
 	}
@@ -139,7 +140,7 @@ func (config *Instance) normalizeAndValidate(base string) error {
 	if err := validateHTTP(config.Listeners.HTTP); err != nil {
 		return fmt.Errorf("listeners.http: %w", err)
 	}
-	if err := validateTelegram(base, &config.Listeners.Telegram); err != nil {
+	if err := validateTelegram(&config.Listeners.Telegram); err != nil {
 		return fmt.Errorf("listeners.telegram: %w", err)
 	}
 	if err := validateCron(config.Listeners.Cron); err != nil {
@@ -169,46 +170,12 @@ func validateHTTP(http HTTPListener) error {
 	return nil
 }
 
-func validateTelegram(base string, telegram *TelegramListener) error {
-	ids := make(map[string]struct{}, len(telegram.Bots))
-	for index := range telegram.Bots {
-		bot := &telegram.Bots[index]
-		if !validID(bot.ID) {
-			return fmt.Errorf("bots[%d].id %q is invalid", index, bot.ID)
-		}
-		if _, exists := ids[bot.ID]; exists {
-			return fmt.Errorf("duplicate bot id %q", bot.ID)
-		}
-		ids[bot.ID] = struct{}{}
-
-		if (bot.Token.Env == "") == (bot.Token.File == "") {
-			return fmt.Errorf("bot %q token must set exactly one of env or file", bot.ID)
-		}
-		if bot.Token.Env != "" && !validEnvName(bot.Token.Env) {
-			return fmt.Errorf("bot %q token env %q is invalid", bot.ID, bot.Token.Env)
-		}
-		if bot.Token.File != "" {
-			resolved, err := resolvePath(base, bot.Token.File)
-			if err != nil {
-				return fmt.Errorf("bot %q token file: %w", bot.ID, err)
-			}
-			bot.Token.File = resolved
-		}
-
-		if bot.APIBase == "" {
-			bot.APIBase = DefaultTelegramAPIBase
-		}
-		parsed, err := url.Parse(bot.APIBase)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-			return fmt.Errorf("bot %q api_base must be an absolute HTTP(S) URL", bot.ID)
-		}
-		bot.APIBase = strings.TrimRight(bot.APIBase, "/")
-		if bot.PollTimeout == 0 {
-			bot.PollTimeout = DefaultTelegramPollTimeout
-		}
-		if bot.PollTimeout <= 0 {
-			return fmt.Errorf("bot %q poll_timeout must be positive", bot.ID)
-		}
+func validateTelegram(telegram *TelegramListener) error {
+	if telegram.ReloadInterval == 0 {
+		telegram.ReloadInterval = DefaultTelegramReloadInterval
+	}
+	if telegram.ReloadInterval <= 0 {
+		return fmt.Errorf("reload_interval must be positive")
 	}
 	return nil
 }

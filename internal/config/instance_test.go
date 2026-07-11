@@ -18,11 +18,6 @@ pipelines_dir: installed
 listeners:
   http:
     enabled: true
-  telegram:
-    bots:
-      - id: main-bot
-        token:
-          file: secrets/telegram-token
   cron:
     schedules:
       - id: every-hour
@@ -54,14 +49,11 @@ listeners:
 	if config.Listeners.HTTP.Address != DefaultHTTPAddress {
 		t.Errorf("HTTP address = %q", config.Listeners.HTTP.Address)
 	}
-	if config.Listeners.Telegram.Bots[0].APIBase != DefaultTelegramAPIBase {
-		t.Errorf("APIBase = %q", config.Listeners.Telegram.Bots[0].APIBase)
+	if config.Listeners.Telegram.BotsDir != filepath.Join(dir, "bots") {
+		t.Errorf("BotsDir = %q", config.Listeners.Telegram.BotsDir)
 	}
-	if config.Listeners.Telegram.Bots[0].PollTimeout != DefaultTelegramPollTimeout {
-		t.Errorf("PollTimeout = %s", config.Listeners.Telegram.Bots[0].PollTimeout)
-	}
-	if want := filepath.Join(dir, "secrets", "telegram-token"); config.Listeners.Telegram.Bots[0].Token.File != want {
-		t.Errorf("token file = %q, want %q", config.Listeners.Telegram.Bots[0].Token.File, want)
+	if config.Listeners.Telegram.ReloadInterval != DefaultTelegramReloadInterval {
+		t.Errorf("ReloadInterval = %s", config.Listeners.Telegram.ReloadInterval)
 	}
 	if config.Listeners.Cron.Timezone != "UTC" {
 		t.Errorf("cron timezone = %q", config.Listeners.Cron.Timezone)
@@ -110,34 +102,6 @@ pipelines_dir: runtime/pipelines
 			message: "must be separate, non-nested directories",
 		},
 		{
-			name: "token alternatives",
-			yaml: `
-version: 1
-listeners:
-  telegram:
-    bots:
-      - id: main
-        token:
-          env: TELEGRAM_TOKEN
-          file: token
-`,
-			message: "exactly one of env or file",
-		},
-		{
-			name: "duplicate bots",
-			yaml: `
-version: 1
-listeners:
-  telegram:
-    bots:
-      - id: main
-        token: {env: TOKEN_ONE}
-      - id: main
-        token: {env: TOKEN_TWO}
-`,
-			message: `duplicate bot id "main"`,
-		},
-		{
 			name: "timezone",
 			yaml: `
 version: 1
@@ -182,6 +146,20 @@ listeners:
 				t.Fatalf("LoadInstance() error = %v, want containing %q", err, test.message)
 			}
 		})
+	}
+}
+
+func TestLoadInstanceRejectsBotsField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "boarkshop.yaml")
+	writeTestFile(t, path, `
+version: 1
+listeners:
+  telegram:
+    bots: []
+`)
+	_, err := LoadInstance(path)
+	if err == nil || !strings.Contains(err.Error(), "field bots not found") {
+		t.Fatalf("LoadInstance() error = %v, want removed-field error", err)
 	}
 }
 
