@@ -1,0 +1,23 @@
+version: 1
+id: http-demo
+enabled: true
+
+env:
+  DEMO_NAME: http-demo
+
+resources:
+  - guard.sh
+  - process.sh
+
+guard:
+  argv:
+    - sh
+    - "{{pipeline_dir}}/guard.sh"
+  timeout: 5s
+
+steps:
+  - id: persist-event
+    argv:
+      - sh
+      - "{{pipeline_dir}}/process.sh"
+    timeout: 10s
