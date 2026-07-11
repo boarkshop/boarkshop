@@ -107,6 +107,88 @@ listeners:
 	}
 }
 
+func TestRunLoadsPipelineAddedAfterStartup(t *testing.T) {
+	root := t.TempDir()
+	address := availableAddress(t)
+	pipelinesDir := filepath.Join(root, "pipelines")
+	if err := os.MkdirAll(pipelinesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(root, "boarkshop.yaml")
+	writeFile(t, configPath, fmt.Sprintf(`
+version: 1
+data_dir: data
+pipelines_dir: pipelines
+queue_size: 8
+max_parallel_processes: 2
+shutdown_timeout: 3s
+listeners:
+  http:
+    enabled: true
+    address: %q
+    max_body_bytes: 4096
+    read_header_timeout: 2s
+  cron:
+    timezone: UTC
+`, address))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, configPath, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Run: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+
+	// Observe that the listener is ready without submitting an event. The first
+	// event must therefore be handled only after the pipeline is published.
+	waitForTCP(t, address, 3*time.Second)
+
+	stagingDir := filepath.Join(root, "hot-add-staging")
+	manifest := fmt.Sprintf(`
+version: 1
+id: hot-added
+env:
+  GO_WANT_BOARKSHOP_HELPER: "1"
+guard:
+  argv: [%q, "-test.run=TestBoarkshopHelperProcess", "--", "guard"]
+  timeout: 2s
+steps:
+  - id: write
+    argv: [%q, "-test.run=TestBoarkshopHelperProcess", "--", "write"]
+    timeout: 2s
+  - id: finish
+    argv: [%q, "-test.run=TestBoarkshopHelperProcess", "--", "finish"]
+    timeout: 2s
+`, os.Args[0], os.Args[0], os.Args[0])
+	writeFile(t, filepath.Join(stagingDir, "pipeline.yaml"), manifest)
+	if err := os.Rename(stagingDir, filepath.Join(pipelinesDir, "hot-added")); err != nil {
+		t.Fatalf("publish pipeline: %v", err)
+	}
+
+	response := postEventually(t, "http://"+address+"/webhooks/hot-add", []byte(`{"hot":"added"}`))
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("HTTP status = %d, want 202", response.StatusCode)
+	}
+	_ = response.Body.Close()
+
+	stateMarker := filepath.Join(root, "data", "pipelines", "hot-added", "complete")
+	waitForFile(t, stateMarker, 3*time.Second)
+	if got, err := os.ReadFile(stateMarker); err != nil || string(got) != "next" {
+		t.Fatalf("hot-added pipeline marker = %q, %v", got, err)
+	}
+}
+
 func TestValidateAllowsEmptyRuntime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "boarkshop.yaml")
 	writeFile(t, path, "version: 1\n")
@@ -170,6 +252,22 @@ func availableAddress(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return address
+}
+
+func waitForTCP(t *testing.T, address string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		connection, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if err == nil {
+			_ = connection.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("listener %q did not start: %v", address, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func postEventually(t *testing.T, url string, body []byte) *http.Response {
