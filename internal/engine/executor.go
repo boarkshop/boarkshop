@@ -41,15 +41,36 @@ type Runner interface {
 	Run(context.Context, processrun.Spec) processrun.Result
 }
 
+// PipelineSource returns the complete set of currently installed pipelines.
+// Implementations must return an error rather than a partial usable set when
+// discovery or validation fails.
+type PipelineSource interface {
+	Load() ([]Pipeline, error)
+}
+
 type runtimePipeline struct {
 	definition Pipeline
-	turn       chan struct{}
+}
+
+type pipelineReload struct {
+	done      chan struct{}
+	pipelines []*runtimePipeline
+}
+
+type pipelineGate struct {
+	turn chan struct{}
+	refs int
 }
 
 // Executor fans each event out to every active pipeline. Runs of one pipeline
 // are serialized, while a shared semaphore bounds child-process concurrency.
 type Executor struct {
+	reloadMu  sync.Mutex
+	reload    *pipelineReload
+	source    PipelineSource
 	pipelines []*runtimePipeline
+	gatesMu   sync.Mutex
+	gates     map[string]*pipelineGate
 	runner    Runner
 	layout    storage.Layout
 	processes chan struct{}
@@ -57,6 +78,20 @@ type Executor struct {
 }
 
 func New(pipelines []Pipeline, runner Runner, layout storage.Layout, maxProcesses int, logger *slog.Logger) (*Executor, error) {
+	return newExecutor(pipelines, nil, runner, layout, maxProcesses, logger)
+}
+
+// NewDynamic creates an executor whose pipeline set is refreshed from source
+// at the beginning of every Handle call. Initial is the already validated
+// startup snapshot; refresh failures retain the last successfully loaded set.
+func NewDynamic(initial []Pipeline, source PipelineSource, runner Runner, layout storage.Layout, maxProcesses int, logger *slog.Logger) (*Executor, error) {
+	if source == nil {
+		return nil, fmt.Errorf("pipeline source is required")
+	}
+	return newExecutor(initial, source, runner, layout, maxProcesses, logger)
+}
+
+func newExecutor(pipelines []Pipeline, source PipelineSource, runner Runner, layout storage.Layout, maxProcesses int, logger *slog.Logger) (*Executor, error) {
 	if runner == nil {
 		return nil, fmt.Errorf("runner is required")
 	}
@@ -67,36 +102,32 @@ func New(pipelines []Pipeline, runner Runner, layout storage.Layout, maxProcesse
 		logger = slog.Default()
 	}
 
-	seen := make(map[string]struct{}, len(pipelines))
-	runtimePipelines := make([]*runtimePipeline, 0, len(pipelines))
-	for _, definition := range pipelines {
-		canonicalID := strings.ToLower(definition.ID)
-		if _, ok := seen[canonicalID]; ok {
-			return nil, fmt.Errorf("duplicate pipeline id %q", definition.ID)
-		}
-		seen[canonicalID] = struct{}{}
-		abs, err := filepath.Abs(definition.Directory)
-		if err != nil {
-			return nil, fmt.Errorf("resolve directory for pipeline %q: %w", definition.ID, err)
-		}
-		definition.Directory = abs
-		turn := make(chan struct{}, 1)
-		turn <- struct{}{}
-		runtimePipelines = append(runtimePipelines, &runtimePipeline{definition: definition, turn: turn})
-	}
-
-	return &Executor{
-		pipelines: runtimePipelines,
+	executor := &Executor{
+		source:    source,
+		gates:     make(map[string]*pipelineGate),
 		runner:    runner,
 		layout:    layout,
 		processes: make(chan struct{}, maxProcesses),
 		logger:    logger,
-	}, nil
+	}
+	runtimePipelines, err := preparePipelines(pipelines)
+	if err != nil {
+		return nil, err
+	}
+	executor.pipelines = runtimePipelines
+	return executor, nil
 }
 
 func (e *Executor) Handle(ctx context.Context, document event.Document) {
+	if ctx.Err() != nil {
+		return
+	}
+	pipelines, ok := e.snapshot(ctx, document.EventID)
+	if !ok || ctx.Err() != nil {
+		return
+	}
 	var wg sync.WaitGroup
-	for _, pipeline := range e.pipelines {
+	for _, pipeline := range pipelines {
 		pipeline := pipeline
 		wg.Add(1)
 		go func() {
@@ -107,13 +138,119 @@ func (e *Executor) Handle(ctx context.Context, document event.Document) {
 	wg.Wait()
 }
 
-func (e *Executor) runPipeline(ctx context.Context, pipeline *runtimePipeline, document event.Document) {
+// PipelineCount returns the number of pipelines in the last valid snapshot.
+func (e *Executor) PipelineCount() int {
+	e.reloadMu.Lock()
+	defer e.reloadMu.Unlock()
+	return len(e.pipelines)
+}
+
+func (e *Executor) snapshot(ctx context.Context, eventID string) ([]*runtimePipeline, bool) {
+	e.reloadMu.Lock()
+	if e.source == nil {
+		pipelines := e.pipelines
+		e.reloadMu.Unlock()
+		return pipelines, ctx.Err() == nil
+	}
+
+	reload := e.reload
+	if reload == nil {
+		reload = &pipelineReload{done: make(chan struct{})}
+		e.reload = reload
+		go e.reloadPipelines(reload, eventID)
+	}
+	e.reloadMu.Unlock()
+
 	select {
 	case <-ctx.Done():
-		return
-	case <-pipeline.turn:
+		return nil, false
+	case <-reload.done:
+		return reload.pipelines, true
 	}
-	defer func() { pipeline.turn <- struct{}{} }()
+}
+
+func (e *Executor) reloadPipelines(reload *pipelineReload, eventID string) {
+	definitions, err := e.source.Load()
+	var prepared []*runtimePipeline
+	if err == nil {
+		prepared, err = preparePipelines(definitions)
+	}
+
+	e.reloadMu.Lock()
+	if err == nil {
+		e.pipelines = prepared
+	}
+	reload.pipelines = e.pipelines
+	e.reload = nil
+	pipelineCount := len(e.pipelines)
+	close(reload.done)
+	e.reloadMu.Unlock()
+
+	if err != nil {
+		e.logger.Error("pipeline catalog reload failed",
+			"event_id", eventID,
+			"error", err,
+			"using_last_good", true,
+			"pipelines", pipelineCount,
+		)
+	}
+}
+
+func preparePipelines(pipelines []Pipeline) ([]*runtimePipeline, error) {
+	seen := make(map[string]struct{}, len(pipelines))
+	runtimePipelines := make([]*runtimePipeline, 0, len(pipelines))
+	for _, source := range pipelines {
+		definition := clonePipeline(source)
+		canonicalID := strings.ToLower(definition.ID)
+		if _, ok := seen[canonicalID]; ok {
+			return nil, fmt.Errorf("duplicate pipeline id %q", definition.ID)
+		}
+		seen[canonicalID] = struct{}{}
+		abs, err := filepath.Abs(definition.Directory)
+		if err != nil {
+			return nil, fmt.Errorf("resolve directory for pipeline %q: %w", definition.ID, err)
+		}
+		definition.Directory = abs
+		runtimePipelines = append(runtimePipelines, &runtimePipeline{definition: definition})
+	}
+	return runtimePipelines, nil
+}
+
+func clonePipeline(source Pipeline) Pipeline {
+	result := source
+	result.Env = cloneMap(source.Env)
+	result.SecretEnv = cloneMap(source.SecretEnv)
+	result.Guard = cloneStep(source.Guard)
+	result.Steps = make([]Step, len(source.Steps))
+	for index, step := range source.Steps {
+		result.Steps[index] = cloneStep(step)
+	}
+	return result
+}
+
+func cloneStep(source Step) Step {
+	result := source
+	result.Argv = append([]string(nil), source.Argv...)
+	return result
+}
+
+func cloneMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func (e *Executor) runPipeline(ctx context.Context, pipeline *runtimePipeline, document event.Document) {
+	release, ok := e.acquirePipeline(ctx, pipeline.definition.ID)
+	if !ok {
+		return
+	}
+	defer release()
 
 	runID, err := newID()
 	if err != nil {
@@ -177,6 +314,40 @@ func (e *Executor) runPipeline(ctx context.Context, pipeline *runtimePipeline, d
 	}
 
 	baseLog.Info("pipeline run completed", "status", "succeeded", "duration_ms", elapsedMilliseconds(startedAt))
+}
+
+func (e *Executor) acquirePipeline(ctx context.Context, pipelineID string) (func(), bool) {
+	canonicalID := strings.ToLower(pipelineID)
+	e.gatesMu.Lock()
+	gate := e.gates[canonicalID]
+	if gate == nil {
+		turn := make(chan struct{}, 1)
+		turn <- struct{}{}
+		gate = &pipelineGate{turn: turn}
+		e.gates[canonicalID] = gate
+	}
+	gate.refs++
+	e.gatesMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		e.releasePipeline(canonicalID, gate)
+		return nil, false
+	case <-gate.turn:
+		return func() {
+			gate.turn <- struct{}{}
+			e.releasePipeline(canonicalID, gate)
+		}, true
+	}
+}
+
+func (e *Executor) releasePipeline(canonicalID string, gate *pipelineGate) {
+	e.gatesMu.Lock()
+	defer e.gatesMu.Unlock()
+	gate.refs--
+	if gate.refs == 0 && e.gates[canonicalID] == gate {
+		delete(e.gates, canonicalID)
+	}
 }
 
 func (e *Executor) runStep(

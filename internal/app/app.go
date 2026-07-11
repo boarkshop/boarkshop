@@ -22,9 +22,8 @@ import (
 )
 
 type definition struct {
-	instance  *config.Instance
-	pipelines []engine.Pipeline
-	bots      []resolvedBot
+	instance *config.Instance
+	bots     []resolvedBot
 }
 
 type resolvedBot struct {
@@ -46,6 +45,10 @@ func Validate(configPath string) error {
 	if err != nil {
 		return err
 	}
+	validationSource := pipelineDirectorySource{root: loaded.instance.PipelinesDir, allowMissing: true}
+	if _, err := validationSource.Load(); err != nil {
+		return err
+	}
 	_, err = makeComponents(loaded, listener.SinkFunc(func(context.Context, event.Document) error { return nil }))
 	return err
 }
@@ -63,9 +66,13 @@ func Run(ctx context.Context, configPath string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-
 	if err := os.MkdirAll(loaded.instance.PipelinesDir, 0o700); err != nil {
 		return fmt.Errorf("create pipelines directory: %w", err)
+	}
+	pipelineSource := pipelineDirectorySource{root: loaded.instance.PipelinesDir}
+	initialPipelines, err := pipelineSource.Load()
+	if err != nil {
+		return err
 	}
 	layout, err := storage.Prepare(loaded.instance.DataDir)
 	if err != nil {
@@ -75,8 +82,9 @@ func Run(ctx context.Context, configPath string, logger *slog.Logger) error {
 		return err
 	}
 
-	executor, err := engine.New(
-		loaded.pipelines,
+	executor, err := engine.NewDynamic(
+		initialPipelines,
+		pipelineSource,
 		processrun.Runner{},
 		layout,
 		loaded.instance.MaxParallelProcesses,
@@ -112,7 +120,7 @@ func Run(ctx context.Context, configPath string, logger *slog.Logger) error {
 		"message", "accepted events can be lost if the process exits unexpectedly",
 	)
 	logger.Info("boarkshop started",
-		"pipelines", len(loaded.pipelines),
+		"pipelines", executor.PipelineCount(),
 		"listeners", len(components),
 		"max_parallel_processes", loaded.instance.MaxParallelProcesses,
 	)
@@ -181,41 +189,6 @@ func loadDefinition(configPath string) (*definition, error) {
 		return nil, err
 	}
 
-	manifests, err := loadPipelineManifests(instance.PipelinesDir)
-	if err != nil {
-		return nil, err
-	}
-	pipelines := make([]engine.Pipeline, 0, len(manifests))
-	for _, manifest := range manifests {
-		if !manifest.Enabled {
-			continue
-		}
-		secretEnv := make(map[string]string, len(manifest.Secrets))
-		for destination, reference := range manifest.Secrets {
-			value, err := resolveReference(reference.Env, reference.File)
-			if err != nil {
-				return nil, fmt.Errorf("pipeline %q secret %q: %w", manifest.ID, destination, err)
-			}
-			secretEnv[destination] = value
-		}
-		steps := make([]engine.Step, 0, len(manifest.Steps))
-		for _, step := range manifest.Steps {
-			steps = append(steps, engine.Step{ID: step.ID, Argv: append([]string(nil), step.Argv...), Timeout: step.Timeout.Std()})
-		}
-		pipelines = append(pipelines, engine.Pipeline{
-			ID:        manifest.ID,
-			Directory: manifest.Dir,
-			Env:       cloneStringMap(manifest.Env),
-			SecretEnv: secretEnv,
-			Guard: engine.Step{
-				ID:      "guard",
-				Argv:    append([]string(nil), manifest.Guard.Argv...),
-				Timeout: manifest.Guard.Timeout.Std(),
-			},
-			Steps: steps,
-		})
-	}
-
 	bots := make([]resolvedBot, 0, len(instance.Listeners.Telegram.Bots))
 	for _, bot := range instance.Listeners.Telegram.Bots {
 		token, err := resolveReference(bot.Token.Env, bot.Token.File)
@@ -232,12 +205,12 @@ func loadDefinition(configPath string) (*definition, error) {
 			PollTimeout: bot.PollTimeout,
 		})
 	}
-	return &definition{instance: instance, pipelines: pipelines, bots: bots}, nil
+	return &definition{instance: instance, bots: bots}, nil
 }
 
-func loadPipelineManifests(root string) ([]*config.Pipeline, error) {
+func loadPipelineManifests(root string, allowMissing bool) ([]*config.Pipeline, error) {
 	info, err := os.Stat(root)
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) && allowMissing {
 		return nil, nil
 	}
 	if err != nil {
