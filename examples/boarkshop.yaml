@@ -1,0 +1,22 @@
+version: 1
+
+data_dir: .runtime
+pipelines_dir: pipelines
+queue_size: 128
+max_parallel_processes: 4
+shutdown_timeout: 30s
+
+listeners:
+  http:
+    enabled: true
+    address: 127.0.0.1:8080
+    max_body_bytes: 1048576
+    read_header_timeout: 5s
+
+  telegram:
+    bots: []
+
+  cron:
+    timezone: UTC
+    schedules: []
+
