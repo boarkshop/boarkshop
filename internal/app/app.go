@@ -23,14 +23,6 @@ import (
 
 type definition struct {
 	instance *config.Instance
-	bots     []resolvedBot
-}
-
-type resolvedBot struct {
-	ID          string
-	Token       string
-	APIBase     string
-	PollTimeout config.Duration
 }
 
 type component struct {
@@ -49,7 +41,18 @@ func Validate(configPath string) error {
 	if _, err := validationSource.Load(); err != nil {
 		return err
 	}
-	_, err = makeComponents(loaded, listener.SinkFunc(func(context.Context, event.Document) error { return nil }))
+	botSource := makeBotSource(loaded, true)
+	initialBots, err := botSource.Load()
+	if err != nil {
+		return err
+	}
+	_, err = makeComponents(
+		loaded,
+		initialBots,
+		botSource,
+		listener.SinkFunc(func(context.Context, event.Document) error { return nil }),
+		slog.Default(),
+	)
 	return err
 }
 
@@ -69,8 +72,16 @@ func Run(ctx context.Context, configPath string, logger *slog.Logger) error {
 	if err := os.MkdirAll(loaded.instance.PipelinesDir, 0o700); err != nil {
 		return fmt.Errorf("create pipelines directory: %w", err)
 	}
+	if err := os.MkdirAll(loaded.instance.Listeners.Telegram.BotsDir, 0o700); err != nil {
+		return fmt.Errorf("create Telegram bots directory: %w", err)
+	}
 	pipelineSource := pipelineDirectorySource{root: loaded.instance.PipelinesDir}
 	initialPipelines, err := pipelineSource.Load()
+	if err != nil {
+		return err
+	}
+	botSource := makeBotSource(loaded, false)
+	initialBots, err := botSource.Load()
 	if err != nil {
 		return err
 	}
@@ -106,7 +117,7 @@ func Run(ctx context.Context, configPath string, logger *slog.Logger) error {
 	}
 
 	sink := dispatcherSink{dispatcher: dispatcher, logger: logger}
-	components, err := makeComponents(loaded, sink)
+	components, err := makeComponents(loaded, initialBots, botSource, sink, logger)
 	if err != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), loaded.instance.ShutdownTimeout.Std())
 		defer cancel()
@@ -121,6 +132,7 @@ func Run(ctx context.Context, configPath string, logger *slog.Logger) error {
 	)
 	logger.Info("boarkshop started",
 		"pipelines", executor.PipelineCount(),
+		"telegram_bots", len(initialBots),
 		"listeners", len(components),
 		"max_parallel_processes", loaded.instance.MaxParallelProcesses,
 	)
@@ -188,24 +200,14 @@ func loadDefinition(configPath string) (*definition, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &definition{instance: instance}, nil
+}
 
-	bots := make([]resolvedBot, 0, len(instance.Listeners.Telegram.Bots))
-	for _, bot := range instance.Listeners.Telegram.Bots {
-		token, err := resolveReference(bot.Token.Env, bot.Token.File)
-		if err != nil {
-			return nil, fmt.Errorf("Telegram bot %q token: %w", bot.ID, err)
-		}
-		if token == "" {
-			return nil, fmt.Errorf("Telegram bot %q token is empty", bot.ID)
-		}
-		bots = append(bots, resolvedBot{
-			ID:          bot.ID,
-			Token:       token,
-			APIBase:     bot.APIBase,
-			PollTimeout: bot.PollTimeout,
-		})
+func makeBotSource(loaded *definition, allowMissing bool) botCatalogSource {
+	return botCatalogSource{
+		root:         loaded.instance.Listeners.Telegram.BotsDir,
+		allowMissing: allowMissing,
 	}
-	return &definition{instance: instance, bots: bots}, nil
 }
 
 func loadPipelineManifests(root string, allowMissing bool) ([]*config.Pipeline, error) {
@@ -222,7 +224,13 @@ func loadPipelineManifests(root string, allowMissing bool) ([]*config.Pipeline, 
 	return config.LoadPipelines(root)
 }
 
-func makeComponents(loaded *definition, sink listener.Sink) ([]component, error) {
+func makeComponents(
+	loaded *definition,
+	initialBots []telegramlistener.Bot,
+	botSource telegramlistener.BotSource,
+	sink listener.Sink,
+	logger *slog.Logger,
+) ([]component, error) {
 	components := make([]component, 0, 3)
 	if loaded.instance.Listeners.HTTP.Enabled {
 		configured := loaded.instance.Listeners.HTTP
@@ -237,22 +245,16 @@ func makeComponents(loaded *definition, sink listener.Sink) ([]component, error)
 		}
 		components = append(components, component{name: "http", start: httpServer.Start})
 	}
-	if len(loaded.bots) > 0 {
-		bots := make([]telegramlistener.Bot, 0, len(loaded.bots))
-		for _, bot := range loaded.bots {
-			bots = append(bots, telegramlistener.Bot{
-				ID:          bot.ID,
-				Token:       bot.Token,
-				APIBase:     bot.APIBase,
-				PollTimeout: bot.PollTimeout.Std(),
-			})
-		}
-		telegram, err := telegramlistener.New(telegramlistener.Config{Bots: bots}, sink)
-		if err != nil {
-			return nil, fmt.Errorf("configure Telegram listener: %w", err)
-		}
-		components = append(components, component{name: "telegram", start: telegram.Start})
+	telegram, err := telegramlistener.NewSupervisor(telegramlistener.SupervisorConfig{
+		Initial:        initialBots,
+		Source:         botSource,
+		ReloadInterval: loaded.instance.Listeners.Telegram.ReloadInterval.Std(),
+		Logger:         logger,
+	}, sink)
+	if err != nil {
+		return nil, fmt.Errorf("configure Telegram listener: %w", err)
 	}
+	components = append(components, component{name: "telegram", start: telegram.Start})
 	if len(loaded.instance.Listeners.Cron.Schedules) > 0 {
 		schedules := make([]cronlistener.Schedule, 0, len(loaded.instance.Listeners.Cron.Schedules))
 		for _, schedule := range loaded.instance.Listeners.Cron.Schedules {

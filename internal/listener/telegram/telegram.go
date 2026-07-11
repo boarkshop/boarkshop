@@ -57,8 +57,21 @@ func New(config Config, sink listener.Sink) (*Listener, error) {
 	if sink == nil {
 		return nil, fmt.Errorf("event sink is required")
 	}
-	if len(config.Bots) == 0 {
-		return nil, fmt.Errorf("at least one Telegram bot is required")
+	normalized, err := normalizeConfig(config, false)
+	if err != nil {
+		return nil, err
+	}
+	return &Listener{
+		bots:       normalized.Bots,
+		retryDelay: normalized.RetryDelay,
+		client:     normalized.HTTPClient,
+		sink:       sink,
+	}, nil
+}
+
+func normalizeConfig(config Config, allowEmpty bool) (Config, error) {
+	if len(config.Bots) == 0 && !allowEmpty {
+		return Config{}, fmt.Errorf("at least one Telegram bot is required")
 	}
 	if config.APIBase == "" {
 		config.APIBase = defaultAPIBase
@@ -67,13 +80,13 @@ func New(config Config, sink listener.Sink) (*Listener, error) {
 		config.PollTimeout = defaultPollTimeout
 	}
 	if config.PollTimeout < 0 {
-		return nil, fmt.Errorf("Telegram poll timeout cannot be negative")
+		return Config{}, fmt.Errorf("Telegram poll timeout cannot be negative")
 	}
 	if config.RetryDelay == 0 {
 		config.RetryDelay = defaultRetryDelay
 	}
 	if config.RetryDelay < 0 {
-		return nil, fmt.Errorf("Telegram retry delay cannot be negative")
+		return Config{}, fmt.Errorf("Telegram retry delay cannot be negative")
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = &http.Client{}
@@ -85,16 +98,16 @@ func New(config Config, sink listener.Sink) (*Listener, error) {
 	for i := range bots {
 		bots[i].ID = strings.TrimSpace(bots[i].ID)
 		if bots[i].ID == "" {
-			return nil, fmt.Errorf("Telegram bot ID is required")
+			return Config{}, fmt.Errorf("Telegram bot ID is required")
 		}
 		if bots[i].Token == "" {
-			return nil, fmt.Errorf("Telegram token for bot %q is required", bots[i].ID)
+			return Config{}, fmt.Errorf("Telegram token for bot %q is required", bots[i].ID)
 		}
 		if _, exists := botIDs[bots[i].ID]; exists {
-			return nil, fmt.Errorf("duplicate Telegram bot ID %q", bots[i].ID)
+			return Config{}, fmt.Errorf("duplicate Telegram bot ID %q", bots[i].ID)
 		}
 		if _, exists := botTokens[bots[i].Token]; exists {
-			return nil, fmt.Errorf("two Telegram bots cannot use the same token")
+			return Config{}, fmt.Errorf("two Telegram bots cannot use the same token")
 		}
 		if bots[i].APIBase == "" {
 			bots[i].APIBase = config.APIBase
@@ -102,24 +115,20 @@ func New(config Config, sink listener.Sink) (*Listener, error) {
 		bots[i].APIBase = strings.TrimRight(bots[i].APIBase, "/")
 		parsedBase, err := url.Parse(bots[i].APIBase)
 		if err != nil || (parsedBase.Scheme != "http" && parsedBase.Scheme != "https") || parsedBase.Host == "" {
-			return nil, fmt.Errorf("Telegram API base for bot %q must be an absolute HTTP(S) URL", bots[i].ID)
+			return Config{}, fmt.Errorf("Telegram API base for bot %q must be an absolute HTTP(S) URL", bots[i].ID)
 		}
 		if bots[i].PollTimeout == 0 {
 			bots[i].PollTimeout = config.PollTimeout
 		}
 		if bots[i].PollTimeout < 0 {
-			return nil, fmt.Errorf("Telegram poll timeout for bot %q cannot be negative", bots[i].ID)
+			return Config{}, fmt.Errorf("Telegram poll timeout for bot %q cannot be negative", bots[i].ID)
 		}
 		botIDs[bots[i].ID] = struct{}{}
 		botTokens[bots[i].Token] = struct{}{}
 	}
 
-	return &Listener{
-		bots:       bots,
-		retryDelay: config.RetryDelay,
-		client:     config.HTTPClient,
-		sink:       sink,
-	}, nil
+	config.Bots = bots
+	return config, nil
 }
 
 // Run long-polls all bots until ctx is canceled. Transient API and
